@@ -1,0 +1,9 @@
+# .gitignore
+*.pyc
+__pycache__/
+.env
+venv/
+.pytest_cache/
+.coverage
+/city_tweet_log.json # Add this to prevent committing the log file
+variables.txt

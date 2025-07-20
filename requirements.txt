@@ -1,0 +1,6 @@
+# requirements.txt
+Flask
+tweepy
+requests
+pytz
+gunicorn # Gunicorn is a production-ready WSGI server often used with Flask
