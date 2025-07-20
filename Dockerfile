@@ -17,7 +17,7 @@ COPY . .
 # Ensure the image file exists
 # If 'It's going to Rain.png' is dynamic or very large, consider Cloud Storage.
 # For now, bundling it is fine.
-COPY "It's going to Rain.png" .
+COPY its_going_to_rain.png .
 
 # Expose the port your Flask app will run on. Cloud Run expects 8080 by default.
 # The `PORT` environment variable will be set by Cloud Run.

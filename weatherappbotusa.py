@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Constants ---
 TWITTER_MAX_CHARS = 280
 CITIES_TO_MONITOR = ["Chicago", "Phoenix", "Miami", "Orlando", "New York City"]
-IMAGE_PATH_RAIN = "It's going to Rain.png" # This image will now always be attached
+IMAGE_PATH_RAIN = "its_going_to_rain.png" # This image will now always be attached
 POST_TO_TWITTER_ENABLED = os.environ.get("POST_TO_TWITTER_ENABLED", "true").lower() == "true"
 LOG_FILE_PATH = "city_tweet_log.json"
 LOG_CLEAR_INTERVAL_HOURS = 10 # Interval to clear the log file
