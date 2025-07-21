@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import pytz
 import json
 import tweepy
+from google.cloud import storage # Import the GCS client library
 
 # --- Configuration ---
 # Set up basic logging
@@ -42,8 +43,9 @@ CITIES = {
 # Timezone for the weather updates (Eastern Time for US cities)
 BOT_TIMEZONE = pytz.timezone('America/New_York')
 
-# Log file for cycling cities and last clear time
-LOG_FILE_PATH = "city_tweet_log.json"
+# Log file for cycling cities and last clear time (now refers to GCS object name)
+LOG_FILE_NAME = "city_tweet_log.json"
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # New environment variable for bucket name
 
 # Image path - ensure this matches the renamed file
 IMAGE_PATH_RAIN = "its_going_to_rain.png" # This image will now always be attached
@@ -54,31 +56,62 @@ LOG_CLEAR_INTERVAL_HOURS = 10
 
 app = Flask(__name__)
 
+# Initialize GCS client globally
+storage_client = None
+if GCS_BUCKET_NAME:
+    try:
+        storage_client = storage.Client()
+        logging.info(f"Google Cloud Storage client initialized for bucket: {GCS_BUCKET_NAME}")
+    except Exception as e:
+        logging.critical(f"Failed to initialize Google Cloud Storage client: {e}. Log persistence will not work.")
+        # If GCS is critical and fails to initialize, you might want to stop the app or mark it unhealthy
+else:
+    logging.warning("GCS_BUCKET_NAME environment variable not set. Log persistence will not work.")
+
+
 # --- Helper Functions ---
 
 def read_log_file():
-    """Reads the last posted city and last clear time from the log file."""
-    if not os.path.exists(LOG_FILE_PATH):
+    """Reads the last posted city and last clear time from the GCS log file."""
+    if not storage_client or not GCS_BUCKET_NAME:
+        logging.warning("GCS client or bucket name not configured. Reverting to ephemeral log behavior.")
+        # Fallback to ephemeral state if GCS is not properly configured
         return {"last_posted_city": None, "last_clear_time_utc": None}
+
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(LOG_FILE_NAME)
+
+    if not blob.exists():
+        logging.info(f"Log file '{LOG_FILE_NAME}' not found in GCS bucket '{GCS_BUCKET_NAME}'. Starting with empty log.")
+        return {"last_posted_city": None, "last_clear_time_utc": None}
+
     try:
-        with open(LOG_FILE_PATH, 'r') as f:
-            data = json.load(f)
-            return data
+        contents = blob.download_as_text()
+        data = json.loads(contents)
+        logging.info(f"Successfully read log data from GCS: {data}")
+        return data
     except json.JSONDecodeError as e:
-        logging.error(f"Error decoding JSON from log file: {e}. Starting with empty log.")
+        logging.error(f"Error decoding JSON from GCS log file: {e}. Starting with empty log.")
         return {"last_posted_city": None, "last_clear_time_utc": None}
     except Exception as e:
-        logging.error(f"Error reading log file: {e}. Starting with empty log.")
+        logging.error(f"Error reading log file from GCS: {e}. Starting with empty log.")
         return {"last_posted_city": None, "last_clear_time_utc": None}
 
 def write_log_file(last_posted_city, last_clear_time_utc):
-    """Writes the last posted city and last clear time to the log file."""
+    """Writes the last posted city and last clear time to the GCS log file."""
+    if not storage_client or not GCS_BUCKET_NAME:
+        logging.warning("GCS client or bucket name not configured. Skipping log write.")
+        return
+
     data = {"last_posted_city": last_posted_city, "last_clear_time_utc": last_clear_time_utc}
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(LOG_FILE_NAME)
+
     try:
-        with open(LOG_FILE_PATH, 'w') as f:
-            json.dump(data, f, indent=4)
+        blob.upload_from_string(json.dumps(data, indent=4), content_type='application/json')
+        logging.info(f"Successfully wrote log data to GCS: {data}")
     except Exception as e:
-        logging.error(f"Error writing to log file: {e}")
+        logging.error(f"Error writing to GCS log file: {e}")
 
 def get_next_city(last_city):
     """Determines the next city to tweet about in a cycle."""
@@ -447,7 +480,7 @@ def run_tweet_task_endpoint():
 def home():
     """A simple endpoint to check if the service is alive."""
     mode = "LIVE MODE" if POST_TO_TWITTER_ENABLED else "TEST MODE"
-    log_data = read_log_file()
+    log_data = read_log_file() # This will now attempt to read from GCS
     last_city = log_data.get("last_posted_city", "N/A")
     last_clear = log_data.get("last_clear_time_utc", "N/A")
     return f"Weather Tweet Bot is alive! Current mode: {mode}. Last posted city: {last_city}. Last log clear (UTC): {last_clear}", 200
