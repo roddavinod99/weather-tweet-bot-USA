@@ -1,6 +1,7 @@
 # Dockerfile
-# Use the official Python image as a base
-FROM python:3.9-slim-buster
+# Use an official Python runtime as a parent image
+# --- CHANGE HERE: from buster to bullseye ---
+FROM python:3.9-slim-bullseye
 
 # Set the working directory in the container
 WORKDIR /app
@@ -8,21 +9,35 @@ WORKDIR /app
 # Copy the requirements file into the container
 COPY requirements.txt .
 
-# Install the Python dependencies
+# Install any needed dependencies specified in requirements.txt
+# --no-cache-dir reduces the image size by not storing pip cache
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code into the container
+# Install fontconfig for fc-cache to work
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fontconfig \
+    # Clean up apt caches to keep image size small
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the font file into the container
+# Make sure consolas.ttf is in the same directory as your Dockerfile
+COPY consolas.ttf /usr/share/fonts/truetype/consolas/consolas.ttf
+# Update font cache
+RUN fc-cache -f -v
+
+# Copy the entire application code into the container
 COPY . .
 
-# Ensure the image file exists
-# If 'It's going to Rain.png' is dynamic or very large, consider Cloud Storage.
-# For now, bundling it is fine.
-COPY its_going_to_rain.png .
-
-# Expose the port your Flask app will run on. Cloud Run expects 8080 by default.
-# The `PORT` environment variable will be set by Cloud Run.
+# Expose the port that the Flask app will listen on
+# Cloud Run typically uses the PORT environment variable
 ENV PORT 8080
+EXPOSE $PORT
 
 # Command to run the application using Gunicorn
-# Gunicorn will serve the Flask app 'app' (from app.py)
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
+# Gunicorn will serve your Flask app (app:app refers to 'app' variable in 'app.py')
+# The --timeout 0 is often useful for long-running processes or to avoid timeouts with external APIs
+# Before (incorrect):
+# CMD ["gunicorn", "-b", "0.0.0.0:$PORT", "app:app"]
+
+# After (correct):
+CMD gunicorn -b 0.0.0.0:$PORT app:app

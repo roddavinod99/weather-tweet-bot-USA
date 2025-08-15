@@ -1,6 +1,7 @@
+# requirements.txt
 Flask
 tweepy
 requests
+Pillow
 pytz
-gunicorn # Gunicorn is a production-ready WSGI server often used with Flask
-google-cloud-storage
+gunicorn
