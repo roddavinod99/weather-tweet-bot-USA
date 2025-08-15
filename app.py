@@ -1,493 +1,564 @@
-# app.py
-
-import os
-import requests
-from flask import Flask, jsonify, request
-import logging
-from datetime import datetime, timedelta
-import pytz
-import json
 import tweepy
-from google.cloud import storage # Import the GCS client library
+import requests
+import os
+import pytz
+from datetime import datetime
+from flask import Flask
+import logging
+from PIL import Image, ImageDraw, ImageFont
 
 # --- Configuration ---
-# Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# API Keys from environment variables
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")
-TWITTER_API_KEY = os.environ.get("TWITTER_API_KEY")
-TWITTER_API_SECRET = os.environ.get("TWITTER_API_SECRET")
-TWITTER_ACCESS_TOKEN = os.environ.get("TWITTER_ACCESS_TOKEN")
-TWITTER_ACCESS_TOKEN_SECRET = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
+# --- Helper Functions ---
+def get_env_variable(var_name, critical=True):
+    """Retrieves an environment variable, raising an error if critical and not found."""
+    value = os.environ.get(var_name)
+    if value is None and critical:
+        raise EnvironmentError(f"Critical environment variable '{var_name}' not found.")
+    return value
 
-# Flag to enable/disable actual tweeting (for testing)
-# Set POST_TO_TWITTER_ENABLED to "true" in Cloud Run environment variables to enable tweeting
+# --- Constants ---
+TWITTER_MAX_CHARS = 280
+GENERATED_IMAGE_PATH = "weather_report.png"
+
 POST_TO_TWITTER_ENABLED = os.environ.get("POST_TO_TWITTER_ENABLED", "false").lower() == "true"
 
-# Define cities and their coordinates (Latitude, Longitude)
-# IMPORTANT: This list is intended to be the 10 US cities for your project.
-CITIES = {
-    "New York City": (40.7128, -74.0060),
-    "Los Angeles": (34.0522, -118.2437),
-    "Chicago": (41.8781, -87.6298),
-    "Houston": (29.7604, -95.3698),
-    "Phoenix": (33.4484, -112.0740),
-    "Philadelphia": (39.9526, -75.1652),
-    "San Antonio": (29.4241, -98.4936),
-    "San Diego": (32.7157, -117.1611),
-    "Dallas": (32.7767, -96.7970),
-    "San Jose": (37.3382, -121.8863)
+if not POST_TO_TWITTER_ENABLED:
+    logging.warning("Twitter interactions are DISABLED (Test Mode).")
+    logging.warning("To enable, set the environment variable POST_TO_TWITTER_ENABLED=true")
+else:
+    logging.info("Twitter interactions ARE ENABLED. Tweets will be posted to Twitter.")
+
+# --- New: Timezone and City Mapping ---
+# This dictionary maps UTC hours to the cities and their timezones.
+SCHEDULED_CITIES = {
+    0: {"city": "San Francisco", "timezone": "America/Los_Angeles"},
+    2: {"city": "New York City", "timezone": "America/New_York"},
+    4: {"city": "Los Angeles", "timezone": "America/Los_Angeles"},
+    6: {"city": "Chicago", "timezone": "America/Chicago"},
+    8: {"city": "Las Vegas", "timezone": "America/Los_Angeles"},
+    10: {"city": "Washington", "timezone": "America/New_York"},
+    12: {"city": "San Francisco", "timezone": "America/Los_Angeles"},
+    14: {"city": "New York City", "timezone": "America/New_York"},
+    16: {"city": "Los Angeles", "timezone": "America/Los_Angeles"},
+    18: {"city": "Chicago", "timezone": "America/Chicago"},
+    20: {"city": "Las Vegas", "timezone": "America/Los_Angeles"},
+    22: {"city": "Washington", "timezone": "America/New_York"},
 }
 
-# Timezone for the weather updates (Eastern Time for US cities)
-BOT_TIMEZONE = pytz.timezone('America/New_York')
-
-# Log file for cycling cities and last clear time (now refers to GCS object name)
-LOG_FILE_NAME = "city_tweet_log.json"
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # New environment variable for bucket name
-
-# Image path - ensure this matches the renamed file
-IMAGE_PATH_RAIN = "its_going_to_rain.png" # This image will now always be attached
-
-# Interval to clear the log and reset city cycle (in hours)
-# If set to 10, the log will clear every 10 hours from the last clear time.
-LOG_CLEAR_INTERVAL_HOURS = 10
-
+# --- Flask App Initialization ---
 app = Flask(__name__)
 
-# Initialize GCS client globally
-storage_client = None
-if GCS_BUCKET_NAME:
+# --- Helper Functions (Continued) ---
+def degrees_to_cardinal(d):
+    """Converts wind direction in degrees to a cardinal direction."""
+    if d is None:
+        return "N/A"
     try:
-        storage_client = storage.Client()
-        logging.info(f"Google Cloud Storage client initialized for bucket: {GCS_BUCKET_NAME}")
-    except Exception as e:
-        logging.critical(f"Failed to initialize Google Cloud Storage client: {e}. Log persistence will not work.")
-        # If GCS is critical and fails to initialize, you might want to stop the app or mark it unhealthy
-else:
-    logging.warning("GCS_BUCKET_NAME environment variable not set. Log persistence will not work.")
-
-
-# --- Helper Functions ---
-
-def read_log_file():
-    """Reads the last posted city and last clear time from the GCS log file."""
-    if not storage_client or not GCS_BUCKET_NAME:
-        logging.warning("GCS client or bucket name not configured. Reverting to ephemeral log behavior.")
-        # Fallback to ephemeral state if GCS is not properly configured
-        return {"last_posted_city": None, "last_clear_time_utc": None}
-
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
-    blob = bucket.blob(LOG_FILE_NAME)
-
-    if not blob.exists():
-        logging.info(f"Log file '{LOG_FILE_NAME}' not found in GCS bucket '{GCS_BUCKET_NAME}'. Starting with empty log.")
-        return {"last_posted_city": None, "last_clear_time_utc": None}
-
-    try:
-        contents = blob.download_as_text()
-        data = json.loads(contents)
-        logging.info(f"Successfully read log data from GCS: {data}")
-        return data
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding JSON from GCS log file: {e}. Starting with empty log.")
-        return {"last_posted_city": None, "last_clear_time_utc": None}
-    except Exception as e:
-        logging.error(f"Error reading log file from GCS: {e}. Starting with empty log.")
-        return {"last_posted_city": None, "last_clear_time_utc": None}
-
-def write_log_file(last_posted_city, last_clear_time_utc):
-    """Writes the last posted city and last clear time to the GCS log file."""
-    if not storage_client or not GCS_BUCKET_NAME:
-        logging.warning("GCS client or bucket name not configured. Skipping log write.")
-        return
-
-    data = {"last_posted_city": last_posted_city, "last_clear_time_utc": last_clear_time_utc}
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
-    blob = bucket.blob(LOG_FILE_NAME)
-
-    try:
-        blob.upload_from_string(json.dumps(data, indent=4), content_type='application/json')
-        logging.info(f"Successfully wrote log data to GCS: {data}")
-    except Exception as e:
-        logging.error(f"Error writing to GCS log file: {e}")
-
-def get_next_city(last_city):
-    """Determines the next city to tweet about in a cycle."""
-    city_names = list(CITIES.keys()) # Use the CITIES dictionary for the list of city names
-    if last_city is None or last_city not in city_names:
-        return city_names[0]  # Start with the first city (e.g., New York City)
-    else:
-        current_index = city_names.index(last_city)
-        next_index = (current_index + 1) % len(city_names)
-        return city_names[next_index]
-
-def deg_to_compass(deg):
-    """Converts degrees to cardinal compass direction."""
+        d = float(d)
+    except (ValueError, TypeError):
+        return "N/A"
     dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
-    ix = int((deg + 11.25) / 22.5)
+    ix = int((d + 11.25) / 22.5)
     return dirs[ix % 16]
 
-def get_weather_forecast(city_name):
-    """
-    Fetches 5-day/3-hour weather forecast data using OpenWeatherMap's 'forecast' endpoint.
-    """
-    weather_api_key = os.environ.get("WEATHER_API_KEY")
-    if not weather_api_key:
-        logging.error("WEATHER_API_KEY not found. Cannot fetch weather.")
-        return None
-
-    # Use the 'forecast' endpoint, which your working code uses, with city name
-    url = f'https://api.openweathermap.org/data/2.5/forecast?q={city_name}&appid={weather_api_key}&units=metric'
-    
-    logging.info(f"Fetching weather forecast from: {url.replace(weather_api_key, 'YOUR_API_KEY_DISPLAY')}")
-
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        return response.json()
-    except requests.exceptions.RequestException as err:
-        logging.error(f"Error fetching weather forecast data for {city_name}: {err}")
-        logging.error(f"Failed URL (check API key/city name): {url.replace(weather_api_key, 'YOUR_API_KEY_DISPLAY')}")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while fetching weather for {city_name}: {e}")
-        return None
-
-def create_weather_tweet_content(city, forecast_data):
-    """
-    Creates the main tweet content with emojis and conditional rain message.
-    Extracts data from the 'forecast' API response structure.
-    """
-    if not forecast_data or 'list' not in forecast_data or not forecast_data['list']:
-        logging.error("No valid forecast data provided to create_weather_tweet_content.")
-        return {"lines": ["Could not generate weather report: Data missing."], "current_weather": {}, "hourly_forecast": []}
-
-    # Use the BOT_TIMEZONE for current time
-    current_time_local = datetime.now(BOT_TIMEZONE)
-    day_of_week = current_time_local.strftime('%A')
-    current_time_str = current_time_local.strftime('%I:%M %p') # e.g., 10:00 AM
-
-    # --- Extract Current Weather Details (from the first item in the forecast list) ---
-    current_weather_data = forecast_data['list'][0]
-    main_conditions = current_weather_data.get('main', {})
-    wind_conditions = current_weather_data.get('wind', {})
-    weather_info = current_weather_data.get('weather', [{}])[0]
-
-    sky_description = weather_info.get('description', "N/A").capitalize()
-    temp_celsius = round(main_conditions.get('temp', 0))
-    feels_like_celsius = round(main_conditions.get('feels_like', 0))
-    humidity = main_conditions.get('humidity', 0)
-    wind_speed_kph = round(wind_conditions.get('speed', 0) * 3.6) # Convert m/s to km/h
-    wind_direction = deg_to_compass(wind_conditions.get('deg', 0))
-
-    # --- Determine Chance of Rain for Tweet Message ---
-    chance_of_rain_percentage = 0
-    # Look at the next 4 intervals (12 hours) of the 3-hour forecast
-    for i in range(1, min(5, len(forecast_data['list']))):
-        forecast_item = forecast_data['list'][i]
-        pop = forecast_item.get('pop', 0) # Probability of Precipitation (0-1)
-        rain_3h = forecast_item.get('rain', {}).get('3h', 0) # Rain volume for 3 hours
-
-        chance_of_rain_percentage = max(chance_of_rain_percentage, int(pop * 100))
-        if rain_3h > 0:
-            chance_of_rain_percentage = max(chance_of_rain_percentage, 25) # Minimum 25% if any rain volume
-
-    rain_message = ""
-    if chance_of_rain_percentage >= 20: # Threshold for "rain expected"
-        rain_message = f"☔ Chance of rain: {chance_of_rain_percentage}%"
+def get_time_based_greeting(hour):
+    """Returns 'Good morning', 'Good afternoon', or 'Good evening' based on the hour."""
+    if 5 <= hour < 12:
+        return "Good morning"
+    elif 12 <= hour < 17:
+        return "Good afternoon"
     else:
-        rain_message = "☔ No significant rain expected soon."
-
-    # --- Main Tweet Content Assembly ---
-    tweet_text_lines = [
-        f"Hello, {city}!👋, {day_of_week} weather as of {current_time_str}:",
-        f"☁️ Sky: {sky_description}",
-        f"🌡️ Temp: {temp_celsius}°C (feels: {feels_like_celsius}°C)",
-        f"💧 Humidity: {humidity}%",
-        f"💨 Wind: {wind_speed_kph} km/h from the {wind_direction}",
-        rain_message, # Conditional rain message
-        "Have a great day! 😊"
-    ]
-
-    return {
-        "lines": tweet_text_lines,
-        "current_weather": { # Pass current weather details for ALT text
-            'temp': temp_celsius, 'feels_like': feels_like_celsius, 'humidity': humidity,
-            'pressure': main_conditions.get('pressure', 0), 'wind_speed': wind_speed_kph,
-            'wind_deg': wind_conditions.get('deg', 0), 'sky': sky_description,
-            'visibility': current_weather_data.get('visibility', 10000) / 1000, # km
-            'clouds': current_weather_data.get('clouds', {}).get('all', 0)
-        },
-        "hourly_forecast": forecast_data['list'][1:5] # Next 4 intervals (12 hours) for ALT text
-    }
-
-def create_alt_text_from_forecast(city_name, current_weather_details, hourly_forecast_data):
-    """
-    Generates detailed alt text for the image based on the new format,
-    using data extracted from the 'forecast' API response structure.
-    """
-    current_time_local = datetime.now(BOT_TIMEZONE)
-
-    # Current weather part
-    alt_text = f"Current weather in {city_name} at {current_time_local.strftime('%I:%M %p')}:\n"
-    alt_text += (
-        f"It's about {current_weather_details['temp']}°C, but feels like {current_weather_details['feels_like']}°C "
-        f"with {current_weather_details['sky'].lower()} skies. Humidity is {current_weather_details['humidity']}%, "
-        f"pressure {current_weather_details['pressure']} hPa. Wind is {current_weather_details['wind_speed']} km/h "
-        f"from the {deg_to_compass(current_weather_details['wind_deg'])}. Visibility around {current_weather_details['visibility']:.0f} km, "
-        f"and cloudiness is {current_weather_details['clouds']}%. \n\n"
-    )
-
-    alt_text += "-------------------><-----------------------\n\n" # Separator
-    alt_text += "Here's what to expect for the next 12 hours:\n"
+        return "Good evening"
+        
+def get_weather_mood(temp_f, hour):
+    """Generates a dynamic mood phrase based on temperature and time of day."""
+    if hour >= 22 or hour < 5:
+        return "calm night"
     
-    # Hourly forecast part - using the next 4 intervals (12 hours total, 3-hour steps)
-    if hourly_forecast_data:
-        for forecast_item in hourly_forecast_data:
-            forecast_time_utc = datetime.fromtimestamp(forecast_item['dt'], tz=pytz.utc)
-            forecast_time_local = forecast_time_utc.astimezone(BOT_TIMEZONE)
-            
-            temp = round(forecast_item.get('main', {}).get('temp', 0))
-            description = forecast_item.get('weather', [{}])[0].get('description', 'N/A').capitalize()
-            pop = int(forecast_item.get('pop', 0) * 100) # Probability of Precipitation
-            rain_volume = forecast_item.get('rain', {}).get('3h', 0) # Rain volume for 3 hours
-
-            rain_info = ""
-            if pop > 0:
-                rain_info = f"Chance of rain: {pop}%."
-                if rain_volume > 0:
-                    rain_info += f" ({rain_volume:.1f}mm expected)."
-            
-            alt_text += (
-                f"By {forecast_time_local.strftime('%I %p')}: Expect {description} around {temp}°C. {rain_info}\n"
-            )
+    if temp_f > 95:  # ~35°C
+        return "warm afternoon" if hour >= 12 else "hot morning"
+    elif temp_f < 68: # ~20°C
+        return "cool morning" if hour < 12 else "chilly afternoon"
     else:
-        alt_text += "Hourly forecast data is not available."
+        return "pleasant day"
+
+def generate_air_quality_text(city, aqi_str, uvi, uvi_level):
+    """Generates dynamic text for air quality and UV index."""
     
-    # Twitter alt text limit is 1000 characters
-    if len(alt_text) > 1000:
-        logging.warning(f"Alt text exceeded 1000 characters ({len(alt_text)}). Truncating.")
-        alt_text = alt_text[:997] + "..."
-
-    return alt_text
-
-def generate_dynamic_hashtags(current_city, forecast_data):
-    """
-    Generates dynamic hashtags based on the city, region, and weather conditions.
-    """
-    hashtags = set() # Use a set to avoid duplicates
-
-    city_hashtag = "#" + "".join(word for word in current_city.split() if word.isalnum())
-    hashtags.add(city_hashtag)
-    hashtags.add("#weatherupdate")
-
-    # Add a general US weather hashtag, as your CITIES list is currently US-based
-    hashtags.add("#USWeather")
+    # Air quality sentence
+    if aqi_str == "good":
+        aqi_text = f"The air quality in {city} is currently {aqi_str}, which is great news for outdoor activities."
+    else:
+        aqi_text = f"The air quality in {city} is currently {aqi_str}. It's a good idea to be mindful of this if you have respiratory sensitivities."
     
-    # Determine if it's the weekend for #WeekendWeather
-    current_time_local = datetime.now(BOT_TIMEZONE)
-    is_weekend = current_time_local.weekday() in [4, 5, 6] # Friday (4), Saturday (5), Sunday (6)
-    if is_weekend:
-        hashtags.add("#WeekendWeather")
-
-    # Check for rain forecast in the next 12 hours (4 intervals)
-    rain_imminent = False
-    if forecast_data and 'list' in forecast_data:
-        for i in range(1, min(5, len(forecast_data['list']))): # Check next 4 intervals
-            forecast_item = forecast_data['list'][i]
-            weather_id = forecast_item.get('weather', [{}])[0].get('id', 800)
-            pop = forecast_item.get('pop', 0)
-            rain_3h = forecast_item.get('rain', {}).get('3h', 0)
-
-            if (200 <= weather_id < 600) or (pop > 0.2) or (rain_3h > 0): # Rain (ID 2xx-5xx), high POP, or actual rain volume
-                rain_imminent = True
-                break
-    
-    if rain_imminent:
-        hashtags.add("#RainyWeather") # New hashtag for rain
-
-    return list(hashtags)
+    # UV index sentence
+    uvi_text = f"The UV Index is {uvi} out of 11 ({uvi_level})."
+    if uvi <= 2:
+        uvi_text += " You don't have to worry too much about sun exposure today."
+    elif uvi <= 5:
+        uvi_text += " A little sunscreen wouldn't hurt, especially if you'll be outside for a while."
+    else:
+        uvi_text += " Be sure to use sun protection like sunscreen and a hat."
+        
+    return f"{aqi_text} {uvi_text}"
 
 # --- Initialize Twitter API Clients (v1.1 for media, v2 for tweets) ---
 bot_api_client_v2 = None
 bot_api_client_v1 = None
 try:
-    consumer_key = os.environ.get("TWITTER_API_KEY")
-    consumer_secret = os.environ.get("TWITTER_API_SECRET")
-    access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
-    access_token_secret = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
-
-    # Check if all keys are present before initializing
-    if not all([consumer_key, consumer_secret, access_token, access_token_secret]):
-        raise EnvironmentError("One or more Twitter API environment variables are missing.")
-
-    # v2 client for creating tweets
+    consumer_key = get_env_variable("TWITTER_API_KEY")
+    consumer_secret = get_env_variable("TWITTER_API_SECRET")
+    access_token = get_env_variable("TWITTER_ACCESS_TOKEN")
+    access_token_secret = get_env_variable("TWITTER_ACCESS_TOKEN_SECRET")
+    
     bot_api_client_v2 = tweepy.Client(
         consumer_key=consumer_key, consumer_secret=consumer_secret,
         access_token=access_token, access_token_secret=access_token_secret
     )
-
-    # v1.1 client is needed for media uploads and metadata
     auth = tweepy.OAuth1UserHandler(consumer_key, consumer_secret, access_token, access_token_secret)
     bot_api_client_v1 = tweepy.API(auth)
-
     logging.info("Twitter v1.1 and v2 clients initialized successfully.")
 except EnvironmentError as e:
     logging.error(f"Error initializing Twitter clients due to missing environment variable: {e}")
-    # Set POST_TO_TWITTER_ENABLED to False if keys are missing
-    POST_TO_TWITTER_ENABLED = False 
 except Exception as e:
     logging.critical(f"An unexpected error occurred during Twitter client initialization: {e}")
-    POST_TO_TWITTER_ENABLED = False
 
+# --- Weather and Data Fetching Functions ---
+def get_city_coordinates(city, api_key):
+    """Fetches latitude and longitude for a city using OpenWeatherMap Geocoding API."""
+    url = f"http://api.openweathermap.org/geo/1.0/direct?q={city},US&limit=1&appid={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data and len(data) > 0:
+            return data[0]['lat'], data[0]['lon']
+        else:
+            logging.error(f"Could not find coordinates for city: {city}")
+            return None, None
+    except requests.exceptions.RequestException as err:
+        logging.error(f"Error fetching coordinates for {city}: {err}")
+        return None, None
+
+def get_one_call_weather_data(lat, lon, api_key):
+    """Fetches weather data using OpenWeatherMap One Call API 3.0 in imperial units."""
+    if not lat or not lon:
+        return None
+    url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}&appid={api_key}&units=imperial&exclude=minutely,daily,alerts"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as err:
+        logging.error(f"Error fetching One Call weather data: {err}")
+        return None
+
+def get_air_pollution_data(lat, lon, api_key):
+    """Fetches air pollution data (AQI)."""
+    if not lat or not lon:
+        return None
+    url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as err:
+        logging.error(f"Error fetching air pollution data: {err}")
+        return None
+
+# --- Tweet Content Creation and Formatting ---
+def generate_dynamic_hashtags(city, weather_data, local_date_time):
+    """Generates a list of hashtags based on weather conditions."""
+    city_no_space = city.replace(" ", "")
+    hashtags = {f'#{city_no_space}', '#weatherupdate'}
+
+    if not weather_data or 'current' not in weather_data:
+        logging.warning("No weather data available for hashtag generation.")
+        return list(hashtags)
+
+    current_weather = weather_data['current']
+    temp_fahrenheit = current_weather.get('temp', 0)
+    sky_description = current_weather.get('weather', [{}])[0].get('description', "").lower()
+    wind_speed_mph = current_weather.get('wind_speed', 0)
+    current_day = local_date_time.strftime('%A')
+    
+    rain_forecasted_in_12_hours = any(
+        'rain' in hour.get('weather', [{}])[0].get('main', '').lower()
+        for hour in weather_data.get('hourly', [])[:12]
+    )
+
+    if rain_forecasted_in_12_hours:
+        hashtags.add(f'#{city_no_space}Rains')
+        hashtags.add('#RainAlert')
+    if temp_fahrenheit > 95:
+        hashtags.add('#Heatwave')
+    elif temp_fahrenheit < 59:
+        hashtags.add('#ColdWeather')
+    if 'clear' in sky_description:
+        hashtags.add('#SunnyDay')
+    elif 'cloud' in sky_description:
+        hashtags.add('#Cloudy')
+    if wind_speed_mph > 20: 
+        hashtags.add('#Windy')
+    if current_day in ['Saturday', 'Sunday']:
+        hashtags.add('#WeekendWeather')
+    
+    return list(hashtags)
+
+def create_weather_tweet_content(city, weather_data, air_pollution_data, local_date_time):
+    """Creates the new conversational tweet content, alt text, and image text."""
+    if not weather_data or 'current' not in weather_data or 'hourly' not in weather_data:
+        logging.error("Missing or invalid weather data for tweet content creation.")
+        return {"lines": ["Could not generate weather report: Data missing."], "hashtags": ["#error"], "alt_text": "", "image_content": "No weather data available."}
+
+    current_day = local_date_time.strftime('%A')
+    current_hour = local_date_time.hour
+
+    # --- Extract Current Weather Data ---
+    current = weather_data['current']
+    temp_f = current.get('temp')
+    feels_like_f = current.get('feels_like')
+    humidity = current.get('humidity')
+    wind_speed_mph = current.get('wind_speed')
+    wind_direction_deg = current.get('wind_deg')
+    uvi = current.get('uvi')
+    
+    # --- Check for future rain to make text dynamic ---
+    future_rain_in_12_hours = any(hour.get('pop', 0) > 0.1 for hour in weather_data.get('hourly', [])[:12])
+    
+    # --- Data Conversion and Formatting ---
+    temp_f_str = f"{temp_f:.0f}°F" if temp_f is not None else "N/A"
+    feels_like_f_str = f"{feels_like_f:.0f}°F" if feels_like_f is not None else "N/A"
+    humidity_str = f"{humidity:.0f}%" if humidity is not None else "N/A"
+    wind_speed_mph_str = f"{wind_speed_mph:.0f} mph" if wind_speed_mph is not None else "N/A"
+    wind_direction_cardinal = degrees_to_cardinal(wind_direction_deg)
+    
+    pop_now = weather_data['hourly'][0].get('pop', 0)
+    pop_str_now = f"{pop_now * 100:.0f}%"
+
+    # --- Air Quality Data ---
+    aqi_str = "moderate" # Default
+    if air_pollution_data and 'list' in air_pollution_data and air_pollution_data['list']:
+        aqi = air_pollution_data['list'][0]['main']['aqi']
+        aqi_map = {1: "good", 2: "fair", 3: "moderate", 4: "poor", 5: "very poor"}
+        aqi_str = aqi_map.get(aqi, "moderate")
+    
+    # --- UV Index Data ---
+    uvi_level = "N/A"
+    if uvi is not None:
+        if uvi <= 2: uvi_level = "low"
+        elif uvi <= 5: uvi_level = "moderate"
+        elif uvi <= 7: uvi_level = "high"
+        else: uvi_level = "very high"
+
+    # --- ALT TEXT AND IMAGE CONTENT GENERATION ---
+    greeting = get_time_based_greeting(current_hour)
+    
+    main_paragraph_intro = f"The city is experiencing a {get_weather_mood(temp_f, current_hour)}."
+    main_paragraph_details = (
+        f"The current temperature is {temp_f_str} and it feels like {feels_like_f_str}. "
+        f"There's a gentle breeze from the {wind_direction_cardinal} at {wind_speed_mph_str}. "
+        f"Humidity is at {humidity_str}."
+    )
+    
+    rain_sentence = ""
+    if pop_now > 0.5:
+        rain_sentence = f"There's a high chance of rain today ({pop_str_now}), so don't forget your umbrella!"
+    elif pop_now > 0.1:
+        rain_sentence = f"There's a small chance of rain today ({pop_str_now}), so keeping an umbrella handy might be a good idea."
+    else:
+        rain_sentence = f"With only a {pop_str_now} chance of rain, you can likely leave your umbrella at home."
+
+    closing_sentence = ""
+    if future_rain_in_12_hours:
+        closing_sentence = f"Stay safe, drive carefully on the wet roads, and enjoy the weather, {city}!"
+    else:
+        closing_sentence = f"Stay safe and enjoy your day. The roads look dry, {city}!"
+
+    # --- Assemble the lines for the image/alt text ---
+    text_lines = []
+    text_lines.append(f"{greeting.title()}, {city}!")
+    text_lines.append(f"{main_paragraph_intro} {main_paragraph_details}, and {rain_sentence}")
+
+    text_lines.append("\nDetailed Forecast for the Next 12 Hours:")
+    text_lines.append("Here's a look at what to expect in the coming hours:")
+    
+    hourly_forecasts = weather_data.get('hourly', [])
+    
+    for i in range(3, 13, 3):
+        if i < len(hourly_forecasts):
+            hour_data = hourly_forecasts[i]
+            
+            # Use the datetime object from the forecast data itself for accuracy.
+            forecast_time = datetime.fromtimestamp(hour_data['dt'], tz=local_date_time.tzinfo)
+            
+            pop_hourly = hour_data.get('pop', 0)
+            rain_inch = hour_data.get('rain', {}).get('1h', 0)
+            description = hour_data.get('weather', [{}])[0].get('description', 'cloudy skies').title()
+            temp_hourly = hour_data.get('temp')
+            temp_hourly_str = f"{temp_hourly:.0f}°F" if temp_hourly is not None else ""
+            time_str = forecast_time.strftime('%I %p')
+            
+            detail_str = f"By {time_str}: Expect {description} around {temp_hourly_str}. "
+            detail_str += f"Chance of rain: {pop_hourly * 100:.0f}%."
+            if rain_inch > 0:
+                detail_str += f" ({rain_inch:.2f}in expected)."
+            text_lines.append(detail_str)
+        else:
+            logging.warning(f"Hourly forecast data not available for hour {i}.")
+            break
+
+    text_lines.append("\nAir Quality & UV Index:")
+    text_lines.append(generate_air_quality_text(city, aqi_str, uvi, uvi_level))
+    text_lines.append(f"\n{closing_sentence}")
+
+    full_text_content = "\n".join(text_lines)
+    
+    # --- Main Tweet Content (A shorter summary) ---
+    description = weather_data['current'].get('weather', [{}])[0].get('description', 'clouds')
+    
+    time_str = local_date_time.strftime('%I:%M %p')
+    date_str = f"{local_date_time.strftime('%B')} {local_date_time.day}"
+    
+    greeting_line = f"{greeting.title()}, {city}! 👋, {current_day} weather as of {date_str}, {time_str}:"
+
+    tweet_lines = [
+        greeting_line,
+        f"It's currently {temp_f_str} (feels like {feels_like_f_str}) with {description}.",
+        f"AQI is {aqi_str}. #StaySafe"
+    ]
+    
+    hashtags = generate_dynamic_hashtags(city, weather_data, local_date_time)
+
+    return {
+        "lines": tweet_lines,
+        "hashtags": hashtags,
+        "alt_text": full_text_content,
+        "image_content": full_text_content
+    }
+
+def create_weather_image(image_text, output_path=GENERATED_IMAGE_PATH):
+    """Generates an image with the weather report text and a centered footer."""
+    try:
+        # Increased height to accommodate the footer
+        img_width, img_height = 860, 550  
+        bg_color, text_color = (34, 71, 102), (255, 255, 255)
+        footer_text = "Weather data provided by OpenWeatherMap API"
+
+        img = Image.new('RGB', (img_width, img_height), color=bg_color)
+        d = ImageDraw.Draw(img)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        font_regular_path = os.path.join(script_dir, "consolas.ttf")
+        font_bold_path = os.path.join(script_dir, "consolasb.ttf")
+
+        try:
+            font_regular = ImageFont.truetype(font_regular_path, 18)
+            font_bold = ImageFont.truetype(font_bold_path, 18)
+            font_size = 17
+            footer_font = ImageFont.truetype(font_regular_path, 14) # Smaller font for the footer
+            logging.info("Successfully loaded Consolas regular and bold fonts.")
+        except IOError:
+            logging.warning("Custom fonts not found. Using default font.")
+            font_regular = ImageFont.load_default()
+            font_bold = font_regular
+            footer_font = ImageFont.load_default()
+            font_size = 10
+
+        line_height = font_size + 7
+        heading_prefixes = ("Good", "Detailed Forecast", "Air Quality")
+        padding_x, padding_y = 20, 20
+        max_text_width = img_width - (2 * padding_x)
+        y_text = padding_y
+
+        # Draw the main text content
+        for original_line in image_text.split('\n'):
+            current_font = font_bold if original_line.strip().startswith(heading_prefixes) else font_regular
+
+            if not original_line.strip():
+                y_text += line_height
+                continue
+
+            words = original_line.split(' ')
+            current_line_words = []
+
+            for word in words:
+                test_line = ' '.join(current_line_words + [word])
+                bbox = d.textbbox((0, 0), test_line, font=current_font)
+                text_w = bbox[2] - bbox[0]
+
+                if text_w <= max_text_width:
+                    current_line_words.append(word)
+                else:
+                    if current_line_words:
+                        d.text((padding_x, y_text), ' '.join(current_line_words), font=current_font, fill=text_color)
+                        y_text += line_height
+                    current_line_words = [word]
+
+            if current_line_words:
+                d.text((padding_x, y_text), ' '.join(current_line_words), font=current_font, fill=text_color)
+                y_text += line_height
+
+            # Stop if we are too close to the footer area
+            if y_text >= img_height - padding_y - (footer_font.size * 2):
+                logging.warning("Image content exceeded image height. Truncating.")
+                break
+
+        # Draw the centered footer at the bottom
+        footer_bbox = d.textbbox((0, 0), footer_text, font=footer_font)
+        footer_width = footer_bbox[2] - footer_bbox[0]
+        footer_x = (img_width - footer_width) / 2
+        footer_y = img_height - padding_y - footer_font.size
+        d.text((footer_x, footer_y), footer_text, font=footer_font, fill=text_color)
+
+        img.save(output_path)
+        logging.info(f"Weather image created successfully at {output_path}")
+        return output_path
+    except Exception as e:
+        logging.error(f"Error creating weather image: {e}")
+        return None
 
 # --- Tweeting Function ---
-def tweet_post(tweet_components, current_city):
-    """Assembles and posts a tweet with an image and alt text."""
-    if not POST_TO_TWITTER_ENABLED:
-        logging.info("[TEST MODE] Skipping actual tweet post.")
-        logging.info("--- Simulated Tweet ---")
-        logging.info("\n".join(tweet_components['lines']))
-        logging.info(f"Hashtags: {' '.join(tweet_components['hashtags'])}")
-        logging.info(f"Image: '{IMAGE_PATH_RAIN}' with Alt Text:\n{tweet_components['alt_text']}")
-        logging.info("--- End Simulated Tweet ---")
-        return True
-
+def tweet_post(tweet_content):
+    """Assembles and posts a tweet with a dynamically generated image."""
     if not all([bot_api_client_v1, bot_api_client_v2]):
         logging.error("Twitter clients not initialized. Aborting tweet post.")
         return False
         
-    body = "\n".join(tweet_components['lines'])
-    hashtags = tweet_components['hashtags']
+    if not POST_TO_TWITTER_ENABLED:
+        logging.info("[TEST MODE] Skipping actual Twitter post.")
+        logging.info("Tweet Content:\n" + "\n".join(tweet_content['lines']) + "\n" + " ".join(tweet_content['hashtags']))
+        
+        generated_image_path = create_weather_image(tweet_content['image_content'])
+        if generated_image_path:
+            logging.info(f"Generated image for inspection: {generated_image_path}")
+        else:
+            logging.error("Failed to generate image for inspection in test mode.")
+        return True
 
+    body = "\n".join(tweet_content['lines'])
+    hashtags = tweet_content['hashtags']
     full_tweet = f"{body}\n{' '.join(hashtags)}"
-    
-    # Character limit check and adjustment
-    TWITTER_MAX_CHARS = 280
+
     if len(full_tweet) > TWITTER_MAX_CHARS:
-        logging.warning(f"Tweet content ({len(full_tweet)} chars) exceeds {TWITTER_MAX_CHARS} char limit. Adjusting hashtags.")
-        # Attempt to remove hashtags until it fits
+        logging.warning("Tweet content exceeds character limit. Adjusting.")
         while hashtags and len(f"{body}\n{' '.join(hashtags)}") > TWITTER_MAX_CHARS:
             hashtags.pop()
-        tweet_text = f"{body}\n{' '.join(hashtags)}" if hashtags else body
-        logging.warning(f"Adjusted tweet length: {len(tweet_text)} chars.")
+        tweet_text = f"{body}\n{' '.join(hashtags)}"
+        if len(tweet_text) > TWITTER_MAX_CHARS:
+            tweet_text = tweet_text[:TWITTER_MAX_CHARS - 3] + "..."
     else:
         tweet_text = full_tweet
-
+    
     media_ids = []
-    if not os.path.exists(IMAGE_PATH_RAIN):
-        logging.error(f"Image not found at '{IMAGE_PATH_RAIN}'. Posting tweet without image.")
-    else:
+    generated_image_path = create_weather_image(tweet_content['image_content'])
+    if generated_image_path and os.path.exists(generated_image_path):
         try:
-            logging.info(f"Uploading media: {IMAGE_PATH_RAIN} for {current_city}")
-            media = bot_api_client_v1.media_upload(filename=IMAGE_PATH_RAIN)
+            logging.info(f"Uploading media: {generated_image_path}")
+            media = bot_api_client_v1.media_upload(filename=generated_image_path)
             media_ids.append(media.media_id)
-            bot_api_client_v1.create_media_metadata(media_id=media.media_id, alt_text=tweet_components['alt_text'])
+            alt_text = tweet_content['alt_text']
+            if len(alt_text) > 1000:
+                alt_text = alt_text[:997] + "..."
+            bot_api_client_v1.create_media_metadata(media_id=media.media_id_string, alt_text=alt_text)
             logging.info("Media uploaded and alt text added successfully.")
         except Exception as e:
-            logging.error(f"Failed to upload media or add alt text for {current_city}: {e}")
-            # Do not return False here, try to post text-only tweet if image failed
-            media_ids = [] # Clear media_ids if upload failed
+            logging.error(f"Failed to upload media or add alt text: {e}")
+        finally:
+            try:
+                os.remove(generated_image_path)
+            except OSError as e:
+                logging.warning(f"Error removing temporary image file {generated_image_path}: {e}")
+    else:
+        logging.error("Failed to generate weather image. Posting tweet without image.")
 
     try:
-        # Pass media_ids as None if the list is empty
-        bot_api_client_v2.create_tweet(text=tweet_text, media_ids=media_ids if media_ids else None)
-        logging.info(f"Tweet for {current_city} posted successfully to Twitter!")
-        logging.info(f"Final Tweet ({len(tweet_text)} chars): \n{tweet_text}")
+        response = bot_api_client_v2.create_tweet(text=tweet_text, media_ids=media_ids if media_ids else None)
+        logging.info(f"Tweet posted successfully! Tweet ID: {response.data['id']}")
         return True
-    except tweepy.errors.TooManyRequests:
-        logging.warning("Rate limit exceeded. Will not retry.")
-        return False
     except tweepy.errors.TweepyException as err:
-        logging.error(f"Error posting tweet for {current_city}: {err}")
-        # Log specific Twitter error details if available
-        if hasattr(err, 'response') and err.response is not None:
-            try:
-                error_json = err.response.json()
-                logging.error(f"Twitter API response error details: {error_json}")
-            except json.JSONDecodeError:
-                logging.error(f"Twitter API response not JSON: {err.response.text}")
+        logging.error(f"Error posting tweet: {err}")
         return False
     except Exception as e:
-        logging.error(f"An unexpected error occurred during tweeting for {current_city}: {e}")
+        logging.critical(f"An unexpected error occurred during tweet posting: {e}")
         return False
 
 # --- Core Task Logic ---
-@app.route('/run-tweet-task', methods=['POST', 'GET'])
-def run_tweet_task_endpoint():
-    """Main endpoint for a scheduler to call, triggering the tweet task."""
-    logging.info("'/run-tweet-task' endpoint triggered by a request.")
-    log_data = read_log_file()
-    last_posted_city = log_data.get("last_posted_city")
-    last_clear_time_utc_str = log_data.get("last_clear_time_utc")
-
-    now_eastern = datetime.now(BOT_TIMEZONE)
-
-    last_clear_time_to_save = None
-
-    if last_clear_time_utc_str:
-        last_clear_time_utc = datetime.fromisoformat(last_clear_time_utc_str).replace(tzinfo=pytz.utc)
-        last_clear_time_eastern = last_clear_time_utc.astimezone(BOT_TIMEZONE)
-        if now_eastern - last_clear_time_eastern >= timedelta(hours=LOG_CLEAR_INTERVAL_HOURS):
-            logging.info(f"Log file content is older than {LOG_CLEAR_INTERVAL_HOURS} hours. Clearing log and restarting city cycle.")
-            last_posted_city = None
-            last_clear_time_to_save = now_eastern.astimezone(pytz.utc).isoformat()
-        else:
-            last_clear_time_to_save = last_clear_time_utc_str
-    else:
-        last_clear_time_to_save = now_eastern.astimezone(pytz.utc).isoformat()
-
-    city_to_post = get_next_city(last_posted_city)
-
-    logging.info(f"--- Running weather tweet job for {city_to_post} ---")
-    forecast_data = get_weather_forecast(city_to_post)
-    if not forecast_data:
-        logging.warning(f"Could not retrieve weather for {city_to_post}. Aborting.")
-        return jsonify({"status": "error", "message": f"Could not retrieve weather for {city_to_post}."}), 500
-
-    # Call create_weather_tweet_content to get the lines, current_weather_details, and hourly_forecast_data
-    tweet_content_parts = create_weather_tweet_content(city_to_post, forecast_data)
+def perform_scheduled_tweet_task():
+    """Main task to fetch data, create content, and post the tweet based on UTC hour."""
+    logging.info("--- Starting scheduled weather tweet job ---")
     
-    # Generate dynamic hashtags separately using the city and forecast_data
-    dynamic_hashtags = generate_dynamic_hashtags(city_to_post, forecast_data)
+    # Get the current UTC hour using the modern approach
+    current_utc_hour = datetime.now(pytz.utc).hour
+    logging.info(f"Current UTC hour is {current_utc_hour}")
     
-    # Create the final tweet_components dictionary to pass to tweet_post
-    # This dictionary needs 'lines', 'hashtags', and 'alt_text' for tweet_post to work
-    final_tweet_components = {
-        'lines': tweet_content_parts['lines'],
-        'hashtags': dynamic_hashtags, # Add the generated hashtags here
-        'alt_text': create_alt_text_from_forecast(
-            city_to_post, 
-            tweet_content_parts['current_weather'], 
-            tweet_content_parts['hourly_forecast']
-        )
-    }
+    # Check if a city is scheduled for this UTC hour
+    if current_utc_hour not in SCHEDULED_CITIES:
+        logging.info(f"No city scheduled for UTC hour {current_utc_hour}. Skipping this run.")
+        return True
+        
+    city_data = SCHEDULED_CITIES[current_utc_hour]
+    city_to_monitor = city_data["city"]
+    city_timezone = pytz.timezone(city_data["timezone"])
+    
+    # Get the current local time for the city
+    local_time = datetime.now(city_timezone)
+    logging.info(f"Selected city for this run: {city_to_monitor}. Local time is {local_time.strftime('%I:%M %p, %A, %B %d, %Y')}")
+    
+    try:
+        weather_api_key = get_env_variable("WEATHER_API_KEY")
+    except EnvironmentError:
+        logging.error("WEATHER_API_KEY not found. Aborting.")
+        return False
 
-    # Now call tweet_post with the correctly assembled dictionary
-    success = tweet_post(final_tweet_components, city_to_post)
+    lat, lon = get_city_coordinates(city_to_monitor, weather_api_key)
+    if not lat or not lon:
+        return False
 
+    weather_data = get_one_call_weather_data(lat, lon, weather_api_key)
+    air_pollution_data = get_air_pollution_data(lat, lon, weather_api_key)
+
+    if not weather_data:
+        logging.warning(f"Could not retrieve weather for {city_to_monitor}. Aborting.")
+        return False
+
+    # Pass the local time to the tweet content creation function
+    tweet_content = create_weather_tweet_content(city_to_monitor, weather_data, air_pollution_data, local_time)
+    
+    if "Could not generate weather report" in tweet_content['lines'][0]:
+        logging.error("Tweet content generation failed. Aborting tweet post.")
+        return False
+
+    success = tweet_post(tweet_content)
     if success:
-        write_log_file(city_to_post, last_clear_time_to_save)
-        logging.info(f"Tweet task for {city_to_post} completed successfully and log updated.")
-        return jsonify({"status": "success", "message": f"Tweet task executed successfully for {city_to_post}.", "city": city_to_post}), 200
+        logging.info(f"Tweet task for {city_to_monitor} completed successfully.")
     else:
-        logging.warning(f"Tweet task for {city_to_post} did not complete successfully. Log not updated for this city.")
-        return jsonify({"status": "error", "message": f"Tweet task for {city_to_post} failed or was skipped."}), 500
+        logging.warning(f"Tweet task for {city_to_monitor} did not complete successfully.")
+    return success
 
+# --- Flask Routes ---
 @app.route('/')
 def home():
     """A simple endpoint to check if the service is alive."""
     mode = "LIVE MODE" if POST_TO_TWITTER_ENABLED else "TEST MODE"
-    log_data = read_log_file() # This will now attempt to read from GCS
-    last_city = log_data.get("last_posted_city", "N/A")
-    last_clear = log_data.get("last_clear_time_utc", "N/A")
-    return f"Weather Tweet Bot is alive! Current mode: {mode}. Last posted city: {last_city}. Last log clear (UTC): {last_clear}", 200
+    return f"Weather Tweet Bot is alive! Current mode: {mode}", 200
 
-# --- Main Execution Block for Local Development ---
+@app.route('/run-tweet-task', methods=['POST', 'GET'])
+def run_tweet_task_endpoint():
+    """Main endpoint for a scheduler to call, triggering the tweet task."""
+    logging.info("'/run-tweet-task' endpoint triggered by a request.")
+    success = perform_scheduled_tweet_task()
+    if success:
+        return "Tweet task executed successfully.", 200
+    else:
+        return "Tweet task execution failed or was skipped.", 500
+
+# --- Main Execution Block ---
 if __name__ == "__main__":
     app_port = int(os.environ.get("PORT", 8080))
-    logging.info(f"--- Starting Flask Server for local development on port {app_port} ---")
-    # Note: debug=True is for development only. Set to False in production.
-    app.run(host='0.0.0.0', port=app_port, debug=True)
+    is_debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    logging.info(f"--- Starting Flask Server on port {app_port} ---")
+    logging.info(f"Debug mode is {'ON' if is_debug_mode else 'OFF'}")
+    app.run(host='0.0.0.0', port=app_port, debug=is_debug_mode)
