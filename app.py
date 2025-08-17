@@ -343,7 +343,7 @@ def create_weather_image(image_text, output_path=GENERATED_IMAGE_PATH):
     """Generates an image with the weather report text and a centered footer."""
     try:
         # Increased height to accommodate the footer
-        img_width, img_height = 860, 550  
+        img_width, img_height = 885, 550  
         bg_color, text_color = (34, 71, 102), (255, 255, 255)
         footer_text = "Weather data provided by OpenWeatherMap API"
 
