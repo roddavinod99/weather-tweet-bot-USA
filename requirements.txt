@@ -1,7 +1,8 @@
 # requirements.txt
 Flask
-tweepy
 requests
-Pillow
+tweepy
 pytz
+Pillow
+matplotlib
 gunicorn
