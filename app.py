@@ -23,6 +23,8 @@ def get_env_variable(var_name, critical=True):
 # --- Constants ---
 TWITTER_MAX_CHARS = 280
 GENERATED_IMAGE_PATH = "weather_report.png"
+GIF_DOWNLOAD_PATH = "weather_radar.gif"
+GIF_URL = "https://radar.weather.gov/ridge/standard/CONUS_loop.gif"
 
 POST_TO_TWITTER_ENABLED = os.environ.get("POST_TO_TWITTER_ENABLED", "false").lower() == "true"
 
@@ -183,7 +185,27 @@ def get_air_pollution_data(lat, lon, api_key):
         logging.error(f"Error fetching air pollution data: {err}")
         return None
 
-# --- Tweet Content Creation and Formatting ---
+def download_weather_gif(gif_url=GIF_URL, output_path=GIF_DOWNLOAD_PATH):
+    """
+    Downloads the weather radar GIF from the provided URL.
+    Returns the path to the downloaded GIF if successful, None otherwise.
+    """
+    try:
+        logging.info(f"Downloading GIF from {gif_url}")
+        response = requests.get(gif_url, timeout=15)
+        response.raise_for_status()
+        
+        with open(output_path, 'wb') as f:
+            f.write(response.content)
+        
+        logging.info(f"GIF downloaded successfully to {output_path}")
+        return output_path
+    except requests.exceptions.RequestException as err:
+        logging.error(f"Error downloading GIF: {err}")
+        return None
+    except IOError as err:
+        logging.error(f"Error saving GIF to file: {err}")
+        return None
 def generate_dynamic_hashtags(city, weather_data, local_date_time):
     """Generates a list of hashtags based on weather conditions."""
     city_no_space = city.replace(" ", "")
@@ -391,7 +413,7 @@ def create_weather_image(image_text_lines, output_path=GENERATED_IMAGE_PATH):
     try:
         # Increased dimensions to hold more text
         img_width, img_height = 985, 690  
-        bg_color, text_color = (34, 71, 102), (255, 255, 255)
+        bg_color, text_color = (52, 52, 52), (252, 230, 207)
         # Note: Footer updated to remove chart reference.
         footer_text = "Detailed Weather Report. Data by OpenWeatherMap API"
 
@@ -478,8 +500,8 @@ def create_weather_image(image_text_lines, output_path=GENERATED_IMAGE_PATH):
 # --- Tweeting Function ---
 def tweet_post(tweet_content, city):
     """
-    Assembles and posts a tweet with the generated text report image.
-    The image is *not* deleted in Test Mode.
+    Assembles and posts a tweet with the generated text report image and weather GIF.
+    The image and GIF are *not* deleted in Test Mode.
     """
     if not all([bot_api_client_v1, bot_api_client_v2]):
         logging.error("Twitter clients not initialized. Aborting tweet post.")
@@ -490,10 +512,14 @@ def tweet_post(tweet_content, city):
     # Check if image creation failed
     if not generated_image_path:
         logging.error("Image generation failed. Aborting media tweet.")
-        # Proceed with text-only tweet for live mode, but skip media
         if not POST_TO_TWITTER_ENABLED:
             logging.info("[TEST MODE] Skipping actual Twitter post. Image creation failed.")
-            return True # Consider test mode successful if it logs the content
+            return True
+    
+    # Download the weather GIF
+    gif_path = download_weather_gif()
+    if not gif_path:
+        logging.warning("GIF download failed. Will continue with image only.")
     
     if not POST_TO_TWITTER_ENABLED:
         logging.info("[TEST MODE] Skipping actual Twitter post.")
@@ -501,9 +527,10 @@ def tweet_post(tweet_content, city):
         
         if generated_image_path:
             logging.info(f"Generated text image for inspection: {generated_image_path}")
+        if gif_path:
+            logging.info(f"Downloaded weather GIF for inspection: {gif_path}")
             
-        # Skip cleanup in test mode
-        logging.info(f"Image was NOT deleted. Check the project directory for {GENERATED_IMAGE_PATH}.")
+        logging.info(f"Media files were NOT deleted. Check the project directory.")
         return True
 
     # --- LIVE MODE (POST_TO_TWITTER_ENABLED is true) ---
@@ -525,7 +552,7 @@ def tweet_post(tweet_content, city):
     media_ids = []
     
     # Upload Text Image
-    if generated_image_path and os.path.exists(generated_image_path): # Check for path existence (FIXED POTENTIAL RUNTIME ISSUE)
+    if generated_image_path and os.path.exists(generated_image_path):
         try:
             logging.info(f"Uploading media: {generated_image_path}")
             media = bot_api_client_v1.media_upload(filename=generated_image_path)
@@ -538,15 +565,32 @@ def tweet_post(tweet_content, city):
         except Exception as e:
             logging.error(f"Failed to upload text image or add alt text: {e}")
     
-    # Cleanup temporary file (Only in LIVE mode)
+    # Upload Weather GIF
+    if gif_path and os.path.exists(gif_path):
+        try:
+            logging.info(f"Uploading media: {gif_path}")
+            media = bot_api_client_v1.media_upload(filename=gif_path, media_category="tweet_gif")
+            media_ids.append(media.media_id)
+            logging.info("Weather GIF uploaded successfully.")
+        except Exception as e:
+            logging.error(f"Failed to upload weather GIF: {e}")
+    
+    # Cleanup temporary files (Only in LIVE mode)
     if generated_image_path and os.path.exists(generated_image_path):
         try:
             os.remove(generated_image_path)
             logging.debug(f"Removed temporary file: {generated_image_path}")
         except OSError as e:
             logging.warning(f"Error removing temporary image file {generated_image_path}: {e}")
+    
+    if gif_path and os.path.exists(gif_path):
+        try:
+            os.remove(gif_path)
+            logging.debug(f"Removed temporary file: {gif_path}")
+        except OSError as e:
+            logging.warning(f"Error removing temporary GIF file {gif_path}: {e}")
 
-    if not media_ids and generated_image_path: # Only warn if an attempt was made to upload an image
+    if not media_ids and generated_image_path:
         logging.warning("No images were successfully uploaded. Posting tweet without media.")
         
     try:
