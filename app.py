@@ -24,7 +24,7 @@ def get_env_variable(var_name, critical=True):
 TWITTER_MAX_CHARS = 280
 GENERATED_IMAGE_PATH = "weather_report.png"
 GIF_DOWNLOAD_PATH = "weather_radar.gif"
-GIF_URL = "https://radar.weather.gov/ridge/standard/CONUS_loop.gif"
+GIF_URL = "https://radar.weather.gov/ridge/standard/CONUS_0.gif"
 
 POST_TO_TWITTER_ENABLED = os.environ.get("POST_TO_TWITTER_ENABLED", "false").lower() == "true"
 
