@@ -86,6 +86,46 @@ def get_weather_mood(temp_f, hour):
         return "cool morning" if hour < 12 else "chilly afternoon"
     else:
         return "pleasant day"
+    
+def maybe_shuffle_lines(lines):
+    """Randomly shuffle middle lines to reduce repetition pattern."""
+    if len(lines) > 3 and random.random() > 0.5:
+        first = lines[0]
+        last = lines[-1]
+        middle = lines[1:-1]
+        random.shuffle(middle)
+        return [first] + middle + [last]
+    return lines
+
+
+def maybe_drop_line(lines):
+    """Randomly remove one middle line but NEVER remove critical data."""
+    if len(lines) > 3 and random.random() > 0.6:
+        # avoid removing first 2 lines (important data)
+        idx = random.randint(2, len(lines)-2)
+        lines.pop(idx)
+    return lines
+    
+def get_random_tweet_template():
+    """Returns one of 5 tweet templates randomly."""
+    templates = [
+        "alert",
+        "casual",
+        "comparison",
+        "question_first",
+        "insight"
+    ]
+    return random.choice(templates)
+
+def maybe_shuffle_lines(lines):
+    """Randomly shuffle middle lines to reduce repetition pattern."""
+    if len(lines) > 3 and random.random() > 0.5:
+        first = lines[0]
+        last = lines[-1]
+        middle = lines[1:-1]
+        random.shuffle(middle)
+        return [first] + middle + [last]
+    return lines   
 
 def generate_air_quality_text(city, aqi_str, uvi, uvi_level):
     """Generates dynamic text for air quality and UV index. (Not used in the final tweet/image content but kept for completeness)."""
@@ -414,16 +454,188 @@ def create_weather_tweet_content(city, weather_data, air_pollution_data, local_d
     full_alt_text = "\n".join(image_text_lines)
 
     # --- Main Tweet Content (A shorter summary) ---
-    greeting_line = f"{greeting.title()}, {city}! 👋, {current_day} weather as of {date_str}, {time_str}:"
+       # --- VIRAL TEMPLATE + RANDOMIZATION SYSTEM ---
 
-    tweet_lines = [
-        greeting_line,
-        f"It's currently {temp_f_str} (feels like {feels_like_f_str}) with {sky_description_now}.",
-        f"AQI is {aqi_str}. #StaySafe"
+    template = get_random_tweet_template()
+
+    # Common variables
+    rain_high = max_pop_in_12_hours > 0.5
+    rain_low = max_pop_in_12_hours > 0.1
+
+    # Random phrase variations (anti-bot pattern)
+    umbrella_phrases = [
+        "better carry an umbrella ☔",
+        "don't forget your umbrella",
+        "you might need rain protection",
+        "keep an umbrella handy",
+        "rain could catch you off guard",
     ]
+
+    enjoy_phrases = [
+        "Looks like a good day ahead 👍",
+        "Weather looks comfortable today",
+        "Pretty comfortable weather overall",
+        "Feels like a nice day ahead",
+        "Weather is looking decent today",
+        "Pretty decent conditions overall",
+        "Should be a smooth weather day",
+    ]
+
+    question_variants = [
+        "Do you like this kind of weather?",
+        "Would you prefer sunshine instead?",
+        "Good weather or not for you?",
+        "Is this your kind of day?",
+        "Perfect weather or nah?",
+    ]
+
+    umbrella_text = random.choice(umbrella_phrases)
+    enjoy_text = random.choice(enjoy_phrases)
+    question = random.choice(question_variants)
+
+    aqi_options = [
+    f"AQI: {aqi_str}",
+    f"Air quality is {aqi_str}",
+    f"Air quality: {aqi_str}",
+]
+
+    aqi_line = random.choice(aqi_options)
+
+    # --- TEMPLATE LOGIC ---
+    tones = ["casual", "alert", "friendly", "minimal", "energetic"]
+    tone = random.choice(tones)
+    
+    aqi_options = [
+    aqi_line,
+    f"Air quality is {aqi_str}",
+    f"Air quality: {aqi_str}",
+]
+
+    aqi_line = random.choice(aqi_options)
+    
+    if tone == "casual":
+     ending = random.choice(question_variants)
+
+    elif tone == "alert":
+        ending = random.choice([
+        "Stay prepared today ⚠️",
+        "Keep an eye on weather changes",
+        "Plan accordingly today",
+    ])
+
+    elif tone == "friendly":
+        ending = random.choice([
+        "Have a great day 😊",
+        "Enjoy your day!",
+        "Stay safe out there",
+    ])
+
+    elif tone == "minimal":
+        ending = ""
+
+    else:
+        ending = random.choice([
+        "Let’s go 💪",
+        "Stay awesome!",
+        "Make the most of it!",
+    ])
+
+    if template == "alert":
+        hook = f"⚠️ {city} weather update"
+        line2 = f"{temp_f_str} right now with {sky_description_now.lower()}."
+        
+        if rain_high:
+            line3 = f"Rain chances up to {pop_str_max} — {umbrella_text}"
+        elif rain_low:
+            line3 = f"Slight rain chance ({pop_str_max}) — {umbrella_text}"
+        else:
+            line3 = enjoy_text
+
+        tweet_lines = [hook, line2, line3, aqi_line]
+
+        if ending:
+            tweet_lines.append(ending)
+
+    elif template == "casual":
+        hook = f"{city} right now 👇"
+        line2 = f"{temp_f_str} (feels like {feels_like_f_str})"
+        line3 = f"{sky_description_now}"
+
+        if rain_high or rain_low:
+            line4 = f"Rain possible ({pop_str_max})"
+        else:
+            line4 = enjoy_text
+
+        tweet_lines = [hook, line2, line3, aqi_line]
+
+        if ending:
+            tweet_lines.append(ending)
+
+    elif template == "comparison":
+        hook = f"{city} vs typical weather 🤔"
+        line2 = f"Current: {temp_f_str}, {sky_description_now}"
+        line3 = aqi_line
+
+        if temp_f and temp_f > 90:
+            line4 = "Hotter than usual 🔥"
+        elif temp_f and temp_f < 50:
+            line4 = "Colder than usual 🥶"
+        else:
+            line4 = "Pretty normal conditions"
+
+        tweet_lines = [hook, line2, line3, aqi_line]
+
+        if ending:
+            tweet_lines.append(ending)
+
+    elif template == "question_first":
+        hook = question
+        line2_options = [
+            f"{city} is currently {temp_f_str} with {sky_description_now.lower()}",
+            f"Right now in {city}: {temp_f_str}, {sky_description_now.lower()}",
+            f"{city} weather right now — {temp_f_str} and {sky_description_now.lower()}",
+        ]
+
+        line2 = random.choice(line2_options)
+
+        if rain_high:
+            line3 = f"High rain chance ({pop_str_max}) — {umbrella_text}"
+        elif rain_low:
+            line3 = f"Some rain possible ({pop_str_max})"
+        else:
+            line3 = enjoy_text
+
+        tweet_lines = [hook, line2, line3, aqi_line]
+
+        if ending:
+            tweet_lines.append(ending)
+
+    else:  # insight template
+        hook = f"{city} weather insight"
+        line2 = f"{temp_f_str} right now, feels like {feels_like_f_str}"
+        line3 = f"{sky_description_now} conditions in {city}"
+
+        if rain_high:
+            line4 = f"Expect rain later ({pop_str_max})"
+        elif rain_low:
+            line4 = f"Low rain chance ({pop_str_max})"
+        else:
+            line4 = enjoy_text
+
+        tweet_lines = [hook, line2, line3, aqi_line]
+
+        if ending:
+            tweet_lines.append(ending)
 
     hashtags = generate_dynamic_hashtags(city, weather_data, local_date_time)
     
+    # Remove duplicate lines
+    tweet_lines = list(dict.fromkeys(tweet_lines))
+
+
+    tweet_lines = maybe_drop_line(tweet_lines)
+    tweet_lines = maybe_shuffle_lines(tweet_lines)
+
     return {
         "lines": tweet_lines,
         "hashtags": hashtags,
