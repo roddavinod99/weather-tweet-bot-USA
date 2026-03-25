@@ -1,0 +1,45 @@
+steps:
+  # Step 1: Build the Docker image
+  # We use the COMMIT_SHA to give every build a unique version
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/weather-tweet-bot-usa/weather-tweet-bot-usa1:$COMMIT_SHA'
+      - '.'
+
+  # Step 2: Push the image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Push'
+    args:
+      - 'push'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/weather-tweet-bot-usa/weather-tweet-bot-usa1:$COMMIT_SHA'
+
+  # Step 3: Deploy to Cloud Run
+  # This tells Cloud Run to use the image we just pushed
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'Deploy'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'weather-tweet-bot-usa1'
+      - '--image'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/weather-tweet-bot-usa/weather-tweet-bot-usa1:$COMMIT_SHA'
+      - '--region'
+      - 'asia-south1'
+      - '--service-account'
+      - 'weather-bot-service@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--platform'
+      - 'managed'
+      - '--quiet'
+
+# CRITICAL: This section prevents the "Bucket not found" error when 
+# using a custom service account.
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+# Optional: Helpful for seeing exactly which project is being built
+substitutions:
+  _REGION: asia-south1
