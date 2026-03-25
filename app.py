@@ -776,7 +776,9 @@ def tweet_post(tweet_content, city):
     
     body = "\n".join(tweet_content['lines'])
     hashtags = tweet_content['hashtags']
-    full_tweet = f"{body}\n{' '.join(hashtags)}"
+    link_line = "Full Forecast: https://devstackhub.duckdns.org/weather-app"
+
+    full_tweet = f"{body}\n{link_line}\n{' '.join(hashtags)}"
 
     if len(full_tweet) > TWITTER_MAX_CHARS:
         logging.warning("Tweet content exceeds character limit. Adjusting.")
